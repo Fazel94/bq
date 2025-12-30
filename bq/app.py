@@ -63,8 +63,9 @@ class BeanQueue:
         self.dispatch_service_cls = dispatch_service_cls
         self._engine = engine
         self._worker_update_shutdown_event: threading.Event = threading.Event()
-        # noop if metrics thread is not started yet, shutdown if it is started
-        self._metrics_server_shutdown: typing.Callable[[], None] = lambda: None
+        # Fix Bug #6: Use Event instead of callback for thread-safe shutdown
+        self._metrics_server_shutdown_event: threading.Event = threading.Event()
+        self._metrics_server_instance: typing.Any = None
 
     def create_default_engine(self):
         return create_engine(
@@ -141,98 +142,143 @@ class BeanQueue:
         self,
         worker_id: typing.Any,
     ):
-        db = self.make_session()
-
-        worker_service = self._make_worker_service(db)
-        dispatch_service = self._make_dispatch_service(db)
-
-        current_worker = worker_service.get_worker(worker_id)
         logger.info(
-            "Updating worker %s with heartbeat_period=%s, heartbeat_timeout=%s",
-            current_worker.id,
+            "Starting worker heartbeat thread for worker %s with heartbeat_period=%s, heartbeat_timeout=%s",
+            worker_id,
             self.config.WORKER_HEARTBEAT_PERIOD,
             self.config.WORKER_HEARTBEAT_TIMEOUT,
         )
         while True:
-            dead_workers = worker_service.fetch_dead_workers(
-                timeout=self.config.WORKER_HEARTBEAT_TIMEOUT
-            )
-            task_count = worker_service.reschedule_dead_tasks(
-                # TODO: a better way to abstract this?
-                dead_workers.with_entities(current_worker.__class__.id)
-            )
-            found_dead_worker = False
-            for dead_worker in dead_workers:
-                found_dead_worker = True
-                logger.info(
-                    "Found dead worker %s (name=%s), reschedule %s dead tasks in channels %s",
-                    dead_worker.id,
-                    dead_worker.name,
-                    task_count,
-                    dead_worker.channels,
+            # Fix Bug #1, #4, #5: Create fresh session each iteration with error handling
+            db = None
+            try:
+                db = self.make_session()
+                worker_service = self._make_worker_service(db)
+                dispatch_service = self._make_dispatch_service(db)
+
+                # Fix Bug #5: Refresh worker object each iteration
+                current_worker = worker_service.get_worker(worker_id)
+                if current_worker is None:
+                    logger.error("Worker %s not found, exiting heartbeat thread", worker_id)
+                    return
+
+                # Check for dead workers
+                dead_workers = worker_service.fetch_dead_workers(
+                    timeout=self.config.WORKER_HEARTBEAT_TIMEOUT
                 )
-                dispatch_service.notify(dead_worker.channels)
-            if found_dead_worker:
+                task_count = worker_service.reschedule_dead_tasks(
+                    # TODO: a better way to abstract this?
+                    dead_workers.with_entities(current_worker.__class__.id)
+                )
+                found_dead_worker = False
+                for dead_worker in dead_workers:
+                    found_dead_worker = True
+                    logger.info(
+                        "Found dead worker %s (name=%s), reschedule %s dead tasks in channels %s",
+                        dead_worker.id,
+                        dead_worker.name,
+                        task_count,
+                        dead_worker.channels,
+                    )
+                    dispatch_service.notify(dead_worker.channels)
+                if found_dead_worker:
+                    db.commit()
+
+                # Check if worker state changed
+                if current_worker.state != models.WorkerState.RUNNING:
+                    # This probably means we are somehow very slow to update the heartbeat in time, or the timeout window
+                    # is set too short. It could also be the administrator update the worker state to something else than
+                    # RUNNING. Regardless the reason, let's stop processing.
+                    logger.warning(
+                        "Current worker %s state is %s instead of running, quit processing",
+                        current_worker.id,
+                        current_worker.state,
+                    )
+                    sys.exit(0)
+
+                # Update heartbeat
+                current_worker.last_heartbeat = func.now()
+                db.add(current_worker)
                 db.commit()
 
-            if current_worker.state != models.WorkerState.RUNNING:
-                # This probably means we are somehow very slow to update the heartbeat in time, or the timeout window
-                # is set too short. It could also be the administrator update the worker state to something else than
-                # RUNNING. Regardless the reason, let's stop processing.
-                logger.warning(
-                    "Current worker %s state is %s instead of running, quit processing",
-                    current_worker.id,
-                    current_worker.state,
+            except Exception as e:
+                logger.error(
+                    "Error in update_workers for worker %s: %s",
+                    worker_id,
+                    e,
+                    exc_info=True
                 )
-                sys.exit(0)
+                # Continue after brief pause to avoid tight error loop
+                if db is not None:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+            finally:
+                # Fix Bug #1: Always close session
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception as e:
+                        logger.error("Error closing session: %s", e)
 
+            # Wait for next heartbeat or shutdown signal
             do_shutdown = self._worker_update_shutdown_event.wait(
                 self.config.WORKER_HEARTBEAT_PERIOD
             )
             if do_shutdown:
+                logger.info("Worker heartbeat thread shutting down")
                 return
-
-            current_worker.last_heartbeat = func.now()
-            db.add(current_worker)
-            db.commit()
 
     def _serve_http_request(
         self, worker_id: typing.Any, environ: dict, start_response: typing.Callable
     ) -> list[bytes]:
         path = environ["PATH_INFO"]
         if path == "/healthz":
+            # Fix Bug #3: Close session in finally block
             db = self.make_session()
-            worker_service = self._make_worker_service(db)
-            worker = worker_service.get_worker(worker_id)
-            if worker is not None and worker.state == models.WorkerState.RUNNING:
-                start_response(
-                    "200 OK",
-                    [
-                        ("Content-Type", "application/json"),
-                    ],
-                )
-                return [
-                    json.dumps(dict(status="ok", worker_id=str(worker_id))).encode(
-                        "utf8"
+            try:
+                worker_service = self._make_worker_service(db)
+                worker = worker_service.get_worker(worker_id)
+                if worker is not None and worker.state == models.WorkerState.RUNNING:
+                    start_response(
+                        "200 OK",
+                        [
+                            ("Content-Type", "application/json"),
+                        ],
                     )
-                ]
-            else:
-                logger.warning("Bad worker %s state %s", worker_id, worker.state)
-                start_response(
-                    "500 Internal Server Error",
-                    [
-                        ("Content-Type", "application/json"),
-                    ],
-                )
-                return [
-                    json.dumps(
-                        dict(
-                            status="internal error",
-                            worker_id=str(worker_id),
-                            state=str(worker.state),
+                    return [
+                        json.dumps(dict(status="ok", worker_id=str(worker_id))).encode(
+                            "utf8"
                         )
-                    ).encode("utf8")
-                ]
+                    ]
+                else:
+                    # Fix Bug #2: Handle None worker case properly
+                    if worker is None:
+                        logger.warning("Worker %s not found", worker_id)
+                        state_str = "NOT_FOUND"
+                    else:
+                        logger.warning("Bad worker %s state %s", worker_id, worker.state)
+                        state_str = str(worker.state)
+
+                    start_response(
+                        "500 Internal Server Error",
+                        [
+                            ("Content-Type", "application/json"),
+                        ],
+                    )
+                    return [
+                        json.dumps(
+                            dict(
+                                status="internal error",
+                                worker_id=str(worker_id),
+                                state=state_str,
+                            )
+                        ).encode("utf8")
+                    ]
+            finally:
+                # Fix Bug #3: Always close session
+                db.close()
         # TODO: add other metrics endpoints
         start_response(
             "404 NOT FOUND",
@@ -251,10 +297,15 @@ class BeanQueue:
             functools.partial(self._serve_http_request, worker_id),
             handler_class=WSGIRequestHandlerWithLogger,
         ) as httpd:
-            # expose graceful shutdown to the main thread
-            self._metrics_server_shutdown = httpd.shutdown
+            # Fix Bug #6: Store server instance for thread-safe shutdown
+            self._metrics_server_instance = httpd
             logger.info("Run metrics HTTP server on %s:%s", host, port)
-            httpd.serve_forever()
+
+            # Serve until shutdown event is set
+            while not self._metrics_server_shutdown_event.is_set():
+                httpd.handle_request()
+
+            logger.info("Metrics HTTP server shutting down")
 
     def process_tasks(
         self,
@@ -366,19 +417,44 @@ class BeanQueue:
         except (SystemExit, KeyboardInterrupt):
             db.rollback()
             logger.info("Shutting down ...")
+
+            # Fix Bug #8: Check if threads stopped properly
+            # Signal worker heartbeat thread to stop
             self._worker_update_shutdown_event.set()
             worker_update_thread.join(5)
-            if metrics_server_thread is not None:
-                # set a threading event, waits until server is shutdown
-                # serve the ongoing requests
-                self._metrics_server_shutdown()
-                metrics_server_thread.join(1)
+            if worker_update_thread.is_alive():
+                logger.error(
+                    "Worker heartbeat thread did not stop within timeout, may be stuck"
+                )
 
-        worker.state = models.WorkerState.SHUTDOWN
-        db.add(worker)
-        task_count = work_service.reschedule_dead_tasks([worker.id])
-        logger.info("Reschedule %s tasks", task_count)
-        dispatch_service.notify(channels)
-        db.commit()
+            # Signal metrics server to stop
+            if metrics_server_thread is not None:
+                # Fix Bug #6: Use event instead of callback
+                self._metrics_server_shutdown_event.set()
+                if self._metrics_server_instance is not None:
+                    try:
+                        self._metrics_server_instance.shutdown()
+                    except Exception as e:
+                        logger.error("Error shutting down metrics server: %s", e)
+
+                metrics_server_thread.join(1)
+                if metrics_server_thread.is_alive():
+                    logger.error(
+                        "Metrics server thread did not stop within timeout, may be stuck"
+                    )
+
+        # Only mark worker as shutdown if heartbeat thread stopped successfully
+        # Otherwise the heartbeat thread may still update the worker state
+        if not worker_update_thread.is_alive():
+            worker.state = models.WorkerState.SHUTDOWN
+            db.add(worker)
+            task_count = work_service.reschedule_dead_tasks([worker.id])
+            logger.info("Reschedule %s tasks", task_count)
+            dispatch_service.notify(channels)
+            db.commit()
+        else:
+            logger.warning(
+                "Worker heartbeat thread still alive, skipping worker state update"
+            )
 
         logger.info("Shutdown gracefully")

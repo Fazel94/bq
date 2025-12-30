@@ -1,5 +1,6 @@
 import datetime
 import enum
+import logging
 import typing
 import uuid
 
@@ -21,6 +22,8 @@ from sqlalchemy.orm import relationship
 
 from ..db.base import Base
 from .helpers import make_repr_attrs
+
+logger = logging.getLogger(__name__)
 
 
 class TaskState(enum.Enum):
@@ -136,7 +139,17 @@ class Task(
 def notify_if_needed(connection: Connection, task: Task):
     session = inspect(task).session
     transaction = session.get_transaction()
-    if transaction is not None:
+
+    # Fix Bug #7: Add warning when transaction is None (deduplication not possible)
+    if transaction is None:
+        logger.debug(
+            "No transaction context for task %s channel %s, "
+            "NOTIFY deduplication not available (may send duplicate notifications)",
+            task.id,
+            task.channel,
+        )
+    else:
+        # Deduplication: only send NOTIFY once per channel per transaction
         key = "_notified_channels"
         if hasattr(transaction, key):
             notified_channels = getattr(transaction, key)
